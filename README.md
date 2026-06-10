@@ -2,7 +2,27 @@
 
 This repository deploys ClickHouse and ClickHouse Keeper on Kubernetes using the **official ClickHouse operator** from [github.com/ClickHouse/clickhouse-operator](https://github.com/ClickHouse/clickhouse-operator), released by ClickHouse Inc. This is not the third-party Altinity operator. The operator uses CRDs in the `clickhouse.com/v1alpha1` API group and relies on built-in ClickHouse Keeper for coordination, so no separate ZooKeeper is required.
 
-## Contents
+The end state is Superset querying ClickHouse for dashboards, replacing a previous Superset, Trino, Hive Metastore, and MinIO stack.
+
+## Why this replaces Trino (architecture)
+
+The previous stack was Superset querying Trino, with Trino reading table metadata from Hive Metastore and data files from MinIO. The new stack is Superset querying ClickHouse directly. **Hive Metastore is no longer required**, and MinIO changes from being the primary data store to an optional backup and cold-tier target.
+
+```
+Before:  Superset -> Trino -> Hive Metastore (catalog)
+                          \-> MinIO (Parquet/ORC data files)
+
+After:   Superset -> ClickHouse (own catalog + data) + Keeper (replication coord)
+                          \-> MinIO (optional: backups, tiered storage, lake queries)
+```
+
+The reason is structural. Trino is a stateless compute engine with no storage of its own, so it has to ask Hive Metastore what tables exist, what their schemas are, and where their files live in object storage. ClickHouse is both the storage engine and the query engine. It keeps its own table catalog internally, including schemas, types, partitioning, and the part-to-file mapping. The Keeper cluster deployed here handles replication coordination for `ReplicatedMergeTree` tables. There is nothing left for an external metastore to do.
+
+Hive Metastore can be retired entirely once data lives in native ClickHouse tables. The only case for keeping it is a transition period where you want ClickHouse to read existing Hive-cataloged tables in place through its `Hive` table engine, which can talk to HMS. That is a migration crutch, not a target state.
+
+MinIO is worth keeping. Use it as the backup target for `clickhouse-backup`, as a cold tier where infrequently accessed parts live on object storage via a storage policy while hot data stays on local SSD, and as a source for ingestion or occasional query-in-place over lake data. The recommended end state is to ingest your datasets into native ClickHouse `ReplicatedMergeTree` tables, retire Hive Metastore, and keep MinIO only for backups and cold storage.
+
+## What is in this repo
 
 ```
 clickhouse-cluster.yaml        Minimal dev cluster (1 shard x 2 replicas, 3 Keepers)
@@ -23,16 +43,44 @@ The deployment in this repo was validated with the following versions. Pin these
 | ClickHouse operator (Helm chart) | `0.0.5` | `oci://ghcr.io/clickhouse/clickhouse-operator-helm` |
 | cert-manager | `v1.16.3` | `github.com/cert-manager/cert-manager` |
 | ClickHouse server / keeper | `25.3` (LTS, recommended pin) | `docker.io/clickhouse/clickhouse-server`, `docker.io/clickhouse/clickhouse-keeper` |
+| Superset (Helm chart / app) | `0.15.5` / `5.0.0` | `https://apache.github.io/superset` |
 | CRD API group | `clickhouse.com/v1alpha1` | Kinds: `ClickHouseCluster`, `KeeperCluster` |
+
+## Deployment order and dependencies
+
+Do the parts in this order. Each one depends on the parts above it. Nothing in a later part works until the earlier parts are healthy.
+
+```
+Prerequisites  (Kubernetes cluster, kubectl, helm)
+  |
+  v
+PART 1  Install operator and cluster
+  1.1 cert-manager                     (the operator needs it for webhook certs)
+  1.2 ClickHouse operator + CRDs       (needs cert-manager)
+  1.3 namespace + password Secret
+  1.4 deploy the ClickHouse cluster    (needs the operator, CRDs, and Secret)
+  1.5 verify
+  |
+  v
+PART 2  Load data into ClickHouse      (needs a running cluster from Part 1)
+  Path A: from MinIO Parquet  OR  Path B: bundled sample data
+  |
+  v
+PART 3  Install Superset and build the dashboard
+  3.1 install Superset
+  3.2 connect Superset to ClickHouse   (needs the cluster from Part 1)
+  3.3 access the UI
+  3.4 build the dashboard              (needs data from Part 2 for charts to show rows)
+```
+
+Parts 2 and 3 both depend only on a running cluster, so you can install Superset (3.1 to 3.3) before or after loading data. The charts in 3.4 only show rows once Part 2 has loaded a table.
 
 ## Prerequisites
 
 - A Kubernetes cluster v1.28.0 or newer with 3 or 4 worker nodes.
 - `kubectl` v1.28.0+ and `helm` v3.8+ (OCI support).
-- cert-manager installed in the cluster. The operator uses it to issue its admission webhook certificates and, optionally, ClickHouse server TLS certificates.
 - A real, SSD-backed StorageClass with reclaim policy `Retain`. Do not use the local-path / hostPath classes that ship with kind or minikube for production data.
-
----
+- cert-manager is required but is installed as step 1.1 below, so it is not a manual prerequisite.
 
 ## Topology recommendation
 
@@ -46,9 +94,13 @@ Keeper stays at **3 in both cases.** Quorum requires an odd count, and 3 already
 
 ---
 
-## Installation guide
+# PART 1: Install the operator and deploy the cluster
 
-### 1. Install cert-manager
+Depends on: the prerequisites above. Do these five steps in order.
+
+### 1.1 Install cert-manager
+
+The operator will not start without it (webhook certificates).
 
 ```bash
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.3/cert-manager.yaml
@@ -58,7 +110,9 @@ kubectl wait --for=condition=Available --timeout=120s \
   -n cert-manager
 ```
 
-### 2. Install the operator
+### 1.2 Install the operator
+
+Depends on 1.1. Installs the controller and the `ClickHouseCluster` / `KeeperCluster` CRDs.
 
 ```bash
 helm install clickhouse-operator oci://ghcr.io/clickhouse/clickhouse-operator-helm \
@@ -75,7 +129,7 @@ kubectl get pods -n clickhouse-operator-system
 kubectl get crd | grep clickhouse.com
 ```
 
-### 3. Create the namespace and default-user password Secret
+### 1.3 Create the namespace and default-user password Secret
 
 The ClickHouse `default` user must have a password in production. Source it from a Secret as a SHA-256 hash; never inline a plaintext password in the manifest.
 
@@ -91,9 +145,9 @@ kubectl create secret generic clickhouse-default-user \
 
 Store the plaintext password in 1Password, not in this repo or your shell history. The manifests reference this Secret via `spec.settings.defaultUserPassword.secret`.
 
-### 4. Edit the manifest, then deploy
+### 1.4 Edit the manifest, then deploy
 
-Open the manifest for your node count and change at minimum:
+Depends on 1.2 (CRDs must exist) and 1.3 (Secret must exist). Open the manifest for your node count and change at minimum:
 
 - `storageClassName` on both `dataVolumeClaimSpec` blocks to your real SSD class.
 - `containerTemplate.image.tag` on both kinds to a verified, pinned tag.
@@ -111,7 +165,7 @@ Then apply:
 kubectl apply -f clickhouse-prod-3nodes.yaml
 ```
 
-### 5. Verify
+### 1.5 Verify
 
 ```bash
 kubectl get keepercluster,clickhousecluster -n clickhouse
@@ -122,11 +176,9 @@ kubectl exec -n clickhouse <a-clickhouse-pod> -- clickhouse-client \
 
 Both custom resources should report `READY True`. The `-o wide` output confirms the anti-affinity worked: no two ClickHouse pods share a node.
 
----
+### How the fault tolerance works (anti-affinity)
 
-## Fault tolerance: how anti-affinity works
-
-You do not write affinity blocks by hand. Setting `spec.podTemplate.nodeHostnameKey: kubernetes.io/hostname` makes the operator generate a **hard** pod anti-affinity rule on every pod:
+Background for what you just deployed. You do not write affinity blocks by hand. Setting `spec.podTemplate.nodeHostnameKey: kubernetes.io/hostname` makes the operator generate a **hard** pod anti-affinity rule on every pod:
 
 ```yaml
 podAntiAffinity:
@@ -146,152 +198,77 @@ The hard consequence: **you must have at least as many nodes as replicas.** With
 
 ---
 
-## Production best practices
+# PART 2: Load data into ClickHouse
 
-These are already reflected in the prod manifests. The reasoning matters for when you tune them.
+Depends on: a running cluster from Part 1. This is the only place MinIO is involved, and it is plain ClickHouse SQL run with `clickhouse-client` inside a pod. Neither the Python script nor the Superset Helm values touch MinIO.
 
-**Do not set a CPU limit on ClickHouse.** ClickHouse parallelizes a single query across cores; a CPU limit triggers CFS throttling that sharply degrades query latency. Set a CPU request for scheduling and a memory limit to bound the OOM blast radius, but leave CPU unlimited. The manifests follow this. Keeper gets a small memory cap because it is lightweight.
+Pick ONE path based on whether your data is already in MinIO. The example dashboard expects a table named `default.sales`. Every command runs inside a ClickHouse pod via `kubectl exec`; you do not install anything locally and you do not connect to MinIO from your laptop. In Path A, ClickHouse itself reaches MinIO from inside the cluster.
 
-**Use Retain storage and size for merges.** ClickHouse rewrites data during background merges, which temporarily needs extra disk. Provision roughly 30 percent headroom over your steady-state data size. A `Retain` reclaim policy ensures deleting a PVC does not destroy data.
+Add `--password "<pw>"` to every `clickhouse-client` command once the `default` user has a password.
 
-**Keep one pod of disruption budget.** `podDisruptionBudget.maxUnavailable: 1` lets node drains and rolling upgrades proceed one pod at a time while a majority keeps serving. With 3 replicas this maintains quorum; with 2 replicas per shard it keeps one replica per shard up.
+A note on the table engine: the operator provisions the `default` database as a **Replicated database engine**. This changes two things versus a vanilla ClickHouse install. First, do not use `ON CLUSTER` for DDL; the Replicated database propagates `CREATE`, `ALTER`, and `DROP` to every replica automatically. Second, do not pass explicit ZooKeeper path or replica name arguments to `ReplicatedMergeTree`; the Replicated database manages those itself, and passing them fails with `BAD_ARGUMENTS`. So the engine is declared with no arguments.
 
-**Pin image tags and constrain upgrade proposals.** Set explicit `image.tag` values and keep server and Keeper on compatible versions. `spec.upgradeChannel: lts` limits the operator to proposing LTS major upgrades; set `stable` for the latest stable line or a specific `major.minor` to freeze.
+### Path A: my data is already in MinIO as Parquet
 
-**Enable TLS for any non-trivial environment.** cert-manager is already a prerequisite. Set `spec.settings.tls.enabled: true` and reference a server certificate Secret via `tls.serverCertSecret.name`. Set `tls.required: true` to refuse plaintext connections entirely. Wire up a cert-manager Issuer and Certificate that writes to that Secret.
-
-**Keep Keeper on fast, low-latency disk.** Keeper fsyncs its Raft log on every commit. Even though its volume is small, slow disk directly raises write latency for the whole ClickHouse cluster. Use the same SSD class, not bulk HDD.
-
-**Plan backups separately.** The operator manages cluster lifecycle, not backups. Use `clickhouse-backup` or `BACKUP ... TO Disk/S3` to an object store on a schedule. Replication protects against node loss, not against accidental `DROP` or data corruption.
-
-**Log in JSON at `information` level.** Both manifests set `logger.jsonLogs: true` and `logger.level: information` so logs are parseable by your aggregation stack and not flooded with `trace` output (the operator default is `trace`).
-
----
-
-## Day-2 operations
-
-**Scale replicas or shards** by editing `spec.replicas` / `spec.shards` and re-applying. Remember the anti-affinity constraint: raising `replicas` requires that many nodes, or new pods stay `Pending`. Add nodes first.
-
-**Connect from inside the cluster** via the headless service:
-
-```bash
-kubectl -n clickhouse port-forward svc/<cluster>-clickhouse-headless 8123:8123 9000:9000
-# then: clickhouse-client --host 127.0.0.1 --password <pw>   (native, 9000)
-#       curl http://127.0.0.1:8123/                          (HTTP)
-```
-
-**Check cluster topology and replication health:**
-
-```bash
-kubectl exec -n clickhouse <pod> -- clickhouse-client --password <pw> -q \
-  "SELECT * FROM system.clusters FORMAT Vertical"
-kubectl exec -n clickhouse <pod> -- clickhouse-client --password <pw> -q \
-  "SELECT database, table, is_readonly, absolute_delay FROM system.replicas"
-```
-
-**Rotate the default-user password** by updating the Secret and re-applying (or letting the operator reconcile). Generate a new SHA-256 hash and `kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -`.
-
----
-
-## Uninstall
-
-```bash
-kubectl delete -f clickhouse-prod-3nodes.yaml          # removes the cluster CRs
-# PVCs are retained by design; delete them explicitly to free storage:
-kubectl delete pvc -n clickhouse -l app.kubernetes.io/part-of=clickhouse-prod
-helm uninstall clickhouse-operator -n clickhouse-operator-system
-```
-
-Deleting the cluster CRs does not delete PVCs, so data survives a recreate. Delete PVCs only when you intend to destroy the data.
-
----
-
-## Architecture: replacing Trino with ClickHouse
-
-The previous stack was Superset querying Trino, with Trino reading table metadata from Hive Metastore and data files from MinIO. The new stack is Superset querying ClickHouse directly. **Hive Metastore is no longer required**, and MinIO changes from being the primary data store to an optional backup and cold-tier target.
-
-```
-Before:  Superset -> Trino -> Hive Metastore (catalog)
-                          \-> MinIO (Parquet/ORC data files)
-
-After:   Superset -> ClickHouse (own catalog + data) + Keeper (replication coord)
-                          \-> MinIO (optional: backups, tiered storage, lake queries)
-```
-
-The reason is structural. Trino is a stateless compute engine with no storage of its own, so it has to ask Hive Metastore what tables exist, what their schemas are, and where their files live in object storage. ClickHouse is both the storage engine and the query engine. It keeps its own table catalog internally, including schemas, types, partitioning, and the part-to-file mapping. The Keeper cluster deployed here handles replication coordination for `ReplicatedMergeTree` tables. There is nothing left for an external metastore to do.
-
-When you would still keep each component:
-
-Hive Metastore can be retired entirely once data lives in native ClickHouse tables. The only case for keeping it is a transition period where you want ClickHouse to read existing Hive-cataloged tables in place through its `Hive` table engine, which can talk to HMS. That is a migration crutch, not a target state.
-
-MinIO is worth keeping even after the migration. Use it as the backup target for `clickhouse-backup`, as a cold tier where infrequently accessed parts live on object storage via a storage policy while hot data stays on local SSD, and as a source for ingestion or occasional query-in-place over lake data.
-
-The recommended end state is to ingest your datasets into native ClickHouse `ReplicatedMergeTree` tables, retire Hive Metastore, and keep MinIO only for backups and cold storage. Query-in-place over MinIO is worth keeping only for large, rarely queried lake data that you do not want to load.
-
----
-
-## Loading Parquet from MinIO into ClickHouse
-
-ClickHouse reads Parquet directly from any S3-compatible store, including MinIO, with the `s3()` table function. No Hive Metastore and no external catalog are involved. You give it an endpoint, credentials, a path, and the format.
-
-This is the only place MinIO appears. It is plain ClickHouse SQL, run with `clickhouse-client`. Neither [build_dashboard.py](build_dashboard.py) nor [superset-values.yaml](superset-values.yaml) has any MinIO configuration; the Python script only builds the Superset dashboard and connects to ClickHouse, and Superset never talks to MinIO directly.
-
-The SQL below uses four placeholders. Replace all of them with your real values before running:
+ClickHouse reads Parquet directly from any S3-compatible store with the `s3()` table function. No Hive Metastore and no external catalog are involved. First replace these four placeholders with your real values:
 
 | Placeholder | Replace with | Example |
 | --- | --- | --- |
-| `https://minio.../warehouse/sales/*.parquet` | Your MinIO endpoint, bucket, and object path or glob. Use `http://` if TLS is not enabled. | `http://minio.minio.svc.cluster.local:9000/lake/sales/*.parquet` |
+| `http://minio.../<BUCKET>/sales/*.parquet` | Your MinIO endpoint, bucket, and object path or glob. Use `https://` if TLS is on. | `http://minio.minio.svc.cluster.local:9000/lake/sales/*.parquet` |
 | `<ACCESS_KEY>` | MinIO access key | from your MinIO credentials Secret |
 | `<SECRET_KEY>` | MinIO secret key | from your MinIO credentials Secret |
 | `'Parquet'` | The file format | `Parquet`, `ORC`, `CSVWithNames`, etc. |
 
-Keep the access and secret keys out of SQL you commit. Either pass them only at the interactive prompt, or define a named credential in the server config with a `<named_collections>` entry and reference it, so the keys live in a Secret-mounted config file instead of inline. For ad hoc reads you can query the files in place:
+Keep the keys out of SQL you commit. Either pass them only at the interactive prompt, or define a `<named_collections>` entry in the server config backed by a Secret-mounted file and reference that instead of inline keys.
 
-```sql
-SELECT *
-FROM s3(
-  'https://minio.minio.svc.cluster.local:9000/warehouse/sales/*.parquet',
-  '<ACCESS_KEY>', '<SECRET_KEY>', 'Parquet'
-)
-LIMIT 10;
-```
+```bash
+# 2a. create the native replicated table (propagates to all replicas)
+kubectl exec -n clickhouse sample-clickhouse-0-0-0 -- clickhouse-client -q "
+CREATE TABLE IF NOT EXISTS default.sales (
+  order_id UInt64, order_date Date,
+  country LowCardinality(String), category LowCardinality(String),
+  quantity UInt32, amount Decimal(12,2)
+) ENGINE = ReplicatedMergeTree ORDER BY (order_date, country)"
 
-For the recommended path, copy the lake data into a native replicated table once and query that. The operator provisions the `default` database as a **Replicated database engine**, which has two consequences that differ from a vanilla ClickHouse install:
-
-First, do not use `ON CLUSTER` for DDL. The Replicated database propagates `CREATE`, `ALTER`, and `DROP` to every replica automatically. Second, do not pass explicit ZooKeeper path or replica name arguments to `ReplicatedMergeTree`. The Replicated database manages those itself, and passing them fails with `BAD_ARGUMENTS`. Declare the engine with no arguments.
-
-```sql
--- Runs on one replica; the Replicated database propagates it to all replicas.
-CREATE TABLE default.sales (
-  order_id   UInt64,
-  order_date Date,
-  country    LowCardinality(String),
-  category   LowCardinality(String),
-  quantity   UInt32,
-  amount     Decimal(12,2)
-) ENGINE = ReplicatedMergeTree
-ORDER BY (order_date, country);
-
--- Bulk load from MinIO Parquet into the native table.
+# 2b. ClickHouse reads the Parquet straight from MinIO and loads it
+kubectl exec -n clickhouse sample-clickhouse-0-0-0 -- clickhouse-client -q "
 INSERT INTO default.sales
 SELECT order_id, order_date, country, category, quantity, amount
-FROM s3(
-  'https://minio.minio.svc.cluster.local:9000/warehouse/sales/*.parquet',
-  '<ACCESS_KEY>', '<SECRET_KEY>', 'Parquet'
-);
+FROM s3('http://minio.minio.svc.cluster.local:9000/<BUCKET>/sales/*.parquet',
+        '<ACCESS_KEY>', '<SECRET_KEY>', 'Parquet')"
 ```
 
-Data inserted on one replica replicates to the others through Keeper. This matters for Superset, which connects through the load-balancing headless service and may land on either replica. With a replicated table, every replica returns identical results.
+For repeating loads, an `S3` table engine pointed at the bucket gives you a reusable external table you can `INSERT INTO ... SELECT` from on a schedule. For Iceberg or Delta lake formats, use the native `Iceberg`, `DeltaLake`, or `Hudi` engines instead of `s3()`; they read the table format's manifests without a Hive Metastore. For a quick look before loading, `SELECT * FROM s3(...) LIMIT 10` queries the files in place.
 
-For repeating loads, an `S3` table engine pointed at the bucket gives you a reusable external table you can `INSERT INTO ... SELECT` from on a schedule. For Iceberg or Delta lake formats, use the native `Iceberg`, `DeltaLake`, or `Hudi` engines instead of `s3()`, which understand the table format's manifests without a Hive Metastore.
+### Path B: I have no MinIO yet and just want to test
+
+Load the bundled synthetic data. [sample-data.sql](sample-data.sql) creates the same `default.sales` table and inserts 200,000 rows:
+
+```bash
+kubectl exec -i -n clickhouse sample-clickhouse-0-0-0 -- \
+  clickhouse-client --multiquery < sample-data.sql
+```
+
+### Verify (both paths)
+
+Confirm the rows replicated to both pods. This matters because Superset connects through the load-balancing headless service and may hit either replica:
+
+```bash
+for p in sample-clickhouse-0-0-0 sample-clickhouse-0-1-0; do
+  kubectl exec -n clickhouse $p -- clickhouse-client -q \
+    "SELECT '$p', count(), round(sum(amount)) FROM default.sales"
+done
+```
+
+Both pods must report the same count and sum. Once they match, Part 2 is done.
 
 ---
 
-## Superset: install, connect, and build dashboards
+# PART 3: Install Superset and build the dashboard
 
-Superset is installed in its own namespace via the official Apache Helm chart and connected to ClickHouse with the official `clickhouse-connect` driver. The values are in [superset-values.yaml](superset-values.yaml).
+Depends on: a running cluster from Part 1. The charts in 3.4 show rows only after Part 2 has loaded `default.sales`. Superset is installed in its own namespace via the official Apache Helm chart and connected to ClickHouse with the official `clickhouse-connect` driver. The values are in [superset-values.yaml](superset-values.yaml).
 
-### Install
+### 3.1 Install Superset
 
 ```bash
 helm repo add superset https://apache.github.io/superset
@@ -307,9 +284,9 @@ Two non-obvious points are baked into the values file. The Superset 5.0 image ru
 
 Before any shared use, replace the placeholder `SUPERSET_SECRET_KEY` with a managed value from 1Password and change the `admin/admin` bootstrap credentials. Both are flagged inline in the values file.
 
-### Connect to ClickHouse
+### 3.2 Connect Superset to ClickHouse
 
-The connection uses the `clickhousedb://` SQLAlchemy dialect from `clickhouse-connect`. Register it from the CLI:
+Depends on Part 1. The connection uses the `clickhousedb://` SQLAlchemy dialect from `clickhouse-connect`. Register it from the CLI:
 
 ```bash
 POD=$(kubectl get pod -n superset -l app=superset -o jsonpath='{.items[0].metadata.name}')
@@ -318,92 +295,28 @@ kubectl exec -n superset $POD -- superset set_database_uri \
   -u "clickhousedb://default:<password>@sample-clickhouse-headless.clickhouse.svc.cluster.local:8123/default"
 ```
 
-The dev cluster's `default` user has no password, so the URI leaves it empty. For production, take the password from the `clickhouse-default-user` Secret and point the host at the production service. You can also add the connection in the UI under Settings, Database Connections, using the same URI.
+The dev cluster's `default` user has no password, so the URI leaves it empty. For production, take the password from the `clickhouse-default-user` Secret and point the host at the production service. You can also add the connection in the UI under Settings, Database Connections, using the same URI. The scripted build in 3.4 creates this connection for you, so this manual step is optional if you use the script.
 
-### Access the UI
+### 3.3 Access the UI
 
 ```bash
 kubectl -n superset port-forward svc/superset 8088:8088
 # http://localhost:8088  (admin / admin)
 ```
 
-### Build the example "Sales Overview" dashboard (reproduce in your own cluster)
+### 3.4 Build the example "Sales Overview" dashboard
 
-This repo ships a working example: a dashboard named **Sales Overview** with five charts (Total Revenue, Total Orders, Revenue by Day, Revenue by Category, Revenue by Country), all querying ClickHouse live through the `clickhousedb` driver. Reproduce it end to end with the steps below. Do every step in order; nothing else is required.
+This repo ships a working example: a dashboard named **Sales Overview** with five charts (Total Revenue, Total Orders, Revenue by Day, Revenue by Category, Revenue by Country), all querying ClickHouse live through the `clickhousedb` driver.
 
-The order is always the same: first get data into a ClickHouse table (Step 1), then port-forward Superset (Step 2), then run the Python script to build the dashboard (Step 3), then open it (Step 4). Loading data and building the dashboard are separate stages. The data load happens entirely in ClickHouse; the Python script runs afterward and never touches MinIO.
+Prerequisite: the `default.sales` table exists (Part 2) and a Superset port-forward is running (3.3). Then build the dashboard with either the script or the UI.
 
-```
-Step 1  data -> ClickHouse        (Path A: from MinIO, or Path B: synthetic test data)
-Step 2  kubectl port-forward Superset
-Step 3  python3 build_dashboard.py   (builds connection + dataset + charts + dashboard)
-Step 4  open the dashboard in the browser
-```
-
-#### Step 1: Get a `default.sales` table into ClickHouse
-
-The dashboard needs a table to chart. Pick ONE of the two paths below based on whether your data is already in MinIO. Both run `clickhouse-client` inside a ClickHouse pod over `kubectl exec`; you do not install anything locally and you do not connect to MinIO from your laptop. In Path A, ClickHouse itself reaches out to MinIO from inside the cluster.
-
-Add `--password "<pw>"` to every `clickhouse-client` command below once the `default` user has a password.
-
-**Path A: my data is already in MinIO as Parquet.**
-
-Run the create-table and the `s3()` load directly on a pod. ClickHouse pulls the Parquet from MinIO over the network. First edit the placeholders (endpoint, bucket/path, keys, format) as described in "Loading Parquet from MinIO into ClickHouse" above.
-
-```bash
-# 1a. create the native replicated table (propagates to all replicas)
-kubectl exec -n clickhouse sample-clickhouse-0-0-0 -- clickhouse-client -q "
-CREATE TABLE IF NOT EXISTS default.sales (
-  order_id UInt64, order_date Date,
-  country LowCardinality(String), category LowCardinality(String),
-  quantity UInt32, amount Decimal(12,2)
-) ENGINE = ReplicatedMergeTree ORDER BY (order_date, country)"
-
-# 1b. ClickHouse reads the Parquet straight from MinIO and loads it
-kubectl exec -n clickhouse sample-clickhouse-0-0-0 -- clickhouse-client -q "
-INSERT INTO default.sales
-SELECT order_id, order_date, country, category, quantity, amount
-FROM s3('http://minio.minio.svc.cluster.local:9000/<BUCKET>/sales/*.parquet',
-        '<ACCESS_KEY>', '<SECRET_KEY>', 'Parquet')"
-```
-
-**Path B: I have no MinIO yet and just want to test.**
-
-Load the bundled synthetic data instead. Pipe [sample-data.sql](sample-data.sql) into `clickhouse-client` on a pod; it creates the same table and inserts 200,000 rows:
-
-```bash
-kubectl exec -i -n clickhouse sample-clickhouse-0-0-0 -- \
-  clickhouse-client --multiquery < sample-data.sql
-```
-
-**Then, for either path, verify the rows replicated to both pods.** This matters because Superset connects through the load-balancing headless service and may hit either replica:
-
-```bash
-for p in sample-clickhouse-0-0-0 sample-clickhouse-0-1-0; do
-  kubectl exec -n clickhouse $p -- clickhouse-client -q \
-    "SELECT '$p', count(), round(sum(amount)) FROM default.sales"
-done
-```
-
-Both pods must report the same count and sum. Once they do, the data step is done. Nothing about loading data involves the Python script; that comes later in Step 3.
-
-#### Step 2: Port-forward Superset
-
-The build script and the UI both reach Superset over this forward. Leave it running in a separate terminal:
-
-```bash
-kubectl -n superset port-forward svc/superset 8088:8088
-```
-
-#### Step 3: Build the dashboard, either scripted or by hand
-
-**Option A, scripted (recommended).** Run the bundled [build_dashboard.py](build_dashboard.py). It logs into Superset, then creates (or reuses, if already present) the ClickHouse database connection, the `sales` dataset, the five charts, and the dashboard, and links them. It is idempotent, so re-running it is safe.
+**Option A, scripted (recommended).** Run the bundled [build_dashboard.py](build_dashboard.py). It logs into Superset, then creates (or reuses, if already present) the ClickHouse database connection, the `sales` dataset, the five charts, and the dashboard, and links them. It is idempotent, so re-running is safe. It needs only the Python standard library.
 
 ```bash
 python3 build_dashboard.py
 ```
 
-It needs only the Python standard library (no `pip install`). When it finishes it prints the dashboard URL, for example `http://localhost:8088/superset/dashboard/2/`. Override any default with environment variables, which is how you point it at production:
+When it finishes it prints the dashboard URL, for example `http://localhost:8088/superset/dashboard/2/`. Override any default with environment variables, which is how you point it at production:
 
 ```bash
 SUPERSET_URL=http://localhost:8088 \
@@ -430,13 +343,75 @@ What the script does, mapped to the Superset REST API, so you can adapt it for y
 3. Assemble the dashboard. Go to Dashboards, then plus. Drag the saved charts onto the canvas, KPIs on the top row and larger charts below, resize by dragging edges, set the title, then Save and toggle Publish.
 4. Add interactivity. In Edit dashboard, use the filter icon to add a date-range filter on `order_date` or a dropdown on `country`. Filters apply to every chart at once.
 
-#### Step 4: Open the dashboard
-
-With the port-forward running, open the printed URL or go to Dashboards and click **Sales Overview**.
+Open the dashboard: with the port-forward running, open the printed URL or go to Dashboards and click **Sales Overview**.
 
 ### Promoting dashboards between environments
 
-Export a dashboard from the Dashboards list as a ZIP bundle and import the same bundle in the target Superset. The bundle carries the charts, the dataset, and the database reference, so promoting dev to production is one import plus updating the database password. The scripted approach also works across environments by changing the environment variables in Step 3.
+Export a dashboard from the Dashboards list as a ZIP bundle and import the same bundle in the target Superset. The bundle carries the charts, the dataset, and the database reference, so promoting dev to production is one import plus updating the database password. The scripted approach also works across environments by changing the environment variables above.
+
+---
+
+## Production best practices
+
+These are already reflected in the prod manifests. The reasoning matters for when you tune them.
+
+**Do not set a CPU limit on ClickHouse.** ClickHouse parallelizes a single query across cores; a CPU limit triggers CFS throttling that sharply degrades query latency. Set a CPU request for scheduling and a memory limit to bound the OOM blast radius, but leave CPU unlimited. The manifests follow this. Keeper gets a small memory cap because it is lightweight.
+
+**Use Retain storage and size for merges.** ClickHouse rewrites data during background merges, which temporarily needs extra disk. Provision roughly 30 percent headroom over your steady-state data size. A `Retain` reclaim policy ensures deleting a PVC does not destroy data.
+
+**Keep one pod of disruption budget.** `podDisruptionBudget.maxUnavailable: 1` lets node drains and rolling upgrades proceed one pod at a time while a majority keeps serving. With 3 replicas this maintains quorum; with 2 replicas per shard it keeps one replica per shard up.
+
+**Pin image tags and constrain upgrade proposals.** Set explicit `image.tag` values and keep server and Keeper on compatible versions. `spec.upgradeChannel: lts` limits the operator to proposing LTS major upgrades; set `stable` for the latest stable line or a specific `major.minor` to freeze.
+
+**Enable TLS for any non-trivial environment.** cert-manager is already installed. Set `spec.settings.tls.enabled: true` and reference a server certificate Secret via `tls.serverCertSecret.name`. Set `tls.required: true` to refuse plaintext connections entirely. Wire up a cert-manager Issuer and Certificate that writes to that Secret.
+
+**Keep Keeper on fast, low-latency disk.** Keeper fsyncs its Raft log on every commit. Even though its volume is small, slow disk directly raises write latency for the whole ClickHouse cluster. Use the same SSD class, not bulk HDD.
+
+**Plan backups separately.** The operator manages cluster lifecycle, not backups. Use `clickhouse-backup` or `BACKUP ... TO Disk/S3` to an object store (MinIO works) on a schedule. Replication protects against node loss, not against accidental `DROP` or data corruption.
+
+**Log in JSON at `information` level.** Both manifests set `logger.jsonLogs: true` and `logger.level: information` so logs are parseable by your aggregation stack and not flooded with `trace` output (the operator default is `trace`).
+
+## Day-2 operations
+
+**Scale replicas or shards** by editing `spec.replicas` / `spec.shards` and re-applying. Remember the anti-affinity constraint: raising `replicas` requires that many nodes, or new pods stay `Pending`. Add nodes first.
+
+**Connect from inside the cluster** via the headless service:
+
+```bash
+kubectl -n clickhouse port-forward svc/<cluster>-clickhouse-headless 8123:8123 9000:9000
+# then: clickhouse-client --host 127.0.0.1 --password <pw>   (native, 9000)
+#       curl http://127.0.0.1:8123/                          (HTTP)
+```
+
+**Check cluster topology and replication health:**
+
+```bash
+kubectl exec -n clickhouse <pod> -- clickhouse-client --password <pw> -q \
+  "SELECT * FROM system.clusters FORMAT Vertical"
+kubectl exec -n clickhouse <pod> -- clickhouse-client --password <pw> -q \
+  "SELECT database, table, is_readonly, absolute_delay FROM system.replicas"
+```
+
+**Rotate the default-user password** by updating the Secret and re-applying (or letting the operator reconcile). Generate a new SHA-256 hash and `kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -`.
+
+## Uninstall
+
+Reverse order of installation. Superset first, then the cluster, then the operator.
+
+```bash
+# Superset
+helm uninstall superset -n superset
+
+# ClickHouse cluster
+kubectl delete -f clickhouse-prod-3nodes.yaml          # removes the cluster CRs
+# PVCs are retained by design; delete them explicitly to free storage:
+kubectl delete pvc -n clickhouse -l app.kubernetes.io/part-of=clickhouse-prod
+
+# operator (and optionally cert-manager)
+helm uninstall clickhouse-operator -n clickhouse-operator-system
+```
+
+Deleting the cluster CRs does not delete PVCs, so data survives a recreate. Delete PVCs only when you intend to destroy the data.
 
 ---
 
