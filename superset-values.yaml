@@ -1,0 +1,64 @@
+# Apache Superset Helm values - dev install wired to the ClickHouse dev cluster.
+# Chart: superset/superset (chart 0.15.5, appVersion 5.0.0)
+
+# Install drivers into Superset's venv at container start. The 5.0 image keeps a
+# venv at /app/.venv with NO pip of its own, so we use `uv pip install --python`
+# to target that venv (the bootstrap runs as root, which can write to it).
+#   - psycopg2-binary: required for the Postgres metadata DB (not bundled)
+#   - clickhouse-connect: official ClickHouse driver, registers the
+#     `clickhousedb://` SQLAlchemy dialect (not bundled)
+#   - redis is already bundled in the image, so it is not reinstalled here.
+bootstrapScript: |
+  #!/bin/bash
+  export UV_CACHE_DIR=/tmp/uv-cache
+  uv pip install --python /app/.venv/bin/python \
+    psycopg2-binary==2.9.9 \
+    "clickhouse-connect>=0.7.0"
+  if [ ! -f ~/bootstrap ]; then echo "Superset bootstrapped" > ~/bootstrap; fi
+
+# SECRET_KEY is session-signing crypto material. This is a NON-SECRET placeholder
+# so the install runs for local testing. Before any shared/prod use, replace it
+# with a managed value from 1Password:
+#   kubectl -n superset create secret generic superset-secret-key \
+#     --from-literal=SUPERSET_SECRET_KEY="$(openssl rand -base64 42)"
+# and reference it via extraSecretEnv / existing secret instead of the line below.
+extraSecretEnv:
+  SUPERSET_SECRET_KEY: "REPLACE_ME_local_testing_only_not_a_real_key"
+
+# Default bootstrap admin account. admin/admin is fine for local testing ONLY.
+# Change the password immediately for anything shared.
+init:
+  adminUser:
+    username: admin
+    firstname: Superset
+    lastname: Admin
+    email: admin@superset.local
+    password: admin
+
+# Keep the bundled Postgres + Redis for metadata/cache (dev default). For prod,
+# point to managed Postgres and Redis instead of the in-cluster pods.
+postgresql:
+  enabled: true
+redis:
+  enabled: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+
+# The Celery worker defaults to one prefork process per node CPU (12 here), which
+# OOMKills under a 1Gi limit. Pin concurrency low for dev and give it more memory.
+supersetWorker:
+  command:
+    - "/bin/sh"
+    - "-c"
+    - ". {{ .Values.configMountPath }}/superset_bootstrap.sh; celery --app=superset.tasks.celery_app:app worker --concurrency=2"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      memory: 2Gi

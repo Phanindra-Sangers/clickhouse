@@ -1,0 +1,113 @@
+# =============================================================================
+# Production-grade ClickHouse + Keeper for a 3-node cluster
+# Topology: 3 Keepers (quorum, tolerates 1 loss) + ClickHouse 1 shard x 3 replicas
+# Operator: ClickHouse/clickhouse-operator, apiVersion clickhouse.com/v1alpha1
+#
+# Before applying, create the default-user password Secret (see bottom of file)
+# and set storageClassName to a real, non-local, retained StorageClass.
+# =============================================================================
+---
+apiVersion: clickhouse.com/v1alpha1
+kind: KeeperCluster
+metadata:
+  name: prod
+  namespace: clickhouse
+  labels:
+    app.kubernetes.io/part-of: clickhouse-prod
+spec:
+  replicas: 3                         # odd number for quorum; 3 tolerates 1 failure
+
+  # Spread the 3 Keeper pods across distinct nodes. Setting nodeHostnameKey
+  # turns on the operator's default anti-affinity so two Keepers never share a node.
+  podTemplate:
+    nodeHostnameKey: kubernetes.io/hostname
+    topologyZoneKey: topology.kubernetes.io/zone   # also spread across zones if multi-AZ
+    terminationGracePeriodSeconds: 60
+
+  containerTemplate:
+    image:
+      repository: docker.io/clickhouse/clickhouse-keeper
+      tag: "25.3"                     # pin to a current LTS; verify the tag exists on Docker Hub
+    resources:
+      requests:
+        cpu: "1"
+        memory: 1Gi
+      limits:
+        memory: 2Gi                   # leave CPU unlimited; Keeper is latency-sensitive
+
+  # Keeper needs a small but FAST, low-latency disk (it fsyncs the Raft log).
+  dataVolumeClaimSpec:
+    accessModes: ["ReadWriteOnce"]
+    storageClassName: fast-ssd        # CHANGE ME: an SSD-backed, Retain-policy class
+    resources:
+      requests:
+        storage: 20Gi
+
+  # Keep at most one Keeper down during voluntary disruptions (node drains, upgrades).
+  podDisruptionBudget:
+    maxUnavailable: 1
+
+  settings:
+    logger:
+      level: information
+      jsonLogs: true
+---
+apiVersion: clickhouse.com/v1alpha1
+kind: ClickHouseCluster
+metadata:
+  name: prod
+  namespace: clickhouse
+  labels:
+    app.kubernetes.io/part-of: clickhouse-prod
+spec:
+  shards: 1
+  replicas: 3                         # 1 shard x 3 replicas: every node holds a full copy
+
+  keeperClusterRef:
+    name: prod                        # same namespace as this resource
+
+  upgradeChannel: lts                 # only propose LTS major upgrades
+
+  podTemplate:
+    nodeHostnameKey: kubernetes.io/hostname        # one replica per node
+    topologyZoneKey: topology.kubernetes.io/zone
+    terminationGracePeriodSeconds: 120
+
+  containerTemplate:
+    image:
+      repository: docker.io/clickhouse/clickhouse-server
+      tag: "25.3"                     # pin; keep server and keeper on compatible versions
+    resources:
+      requests:
+        cpu: "4"
+        memory: 16Gi
+      limits:
+        memory: 32Gi                  # do NOT set a CPU limit on ClickHouse; it throttles queries
+
+  dataVolumeClaimSpec:
+    accessModes: ["ReadWriteOnce"]
+    storageClassName: fast-ssd        # CHANGE ME: SSD-backed, Retain reclaim policy
+    resources:
+      requests:
+        storage: 500Gi                # size for your data + ~30% headroom for merges
+
+  podDisruptionBudget:
+    maxUnavailable: 1                 # with 3 replicas, keeps a majority serving during drains
+
+  settings:
+    # default-user password sourced from a Secret (never inline a password here)
+    defaultUserPassword:
+      passwordType: sha256_hash
+      secret:
+        name: clickhouse-default-user
+        key: password-sha256
+    logger:
+      level: information
+      jsonLogs: true
+    # TLS is supported via settings.tls.enabled + a cert Secret (cert-manager).
+    # Enable once you have an issuer wired up:
+    # tls:
+    #   enabled: true
+    #   required: false
+    #   serverCertSecret:
+    #     name: clickhouse-server-tls

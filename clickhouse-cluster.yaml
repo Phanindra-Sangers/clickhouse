@@ -1,0 +1,25 @@
+apiVersion: clickhouse.com/v1alpha1
+kind: KeeperCluster
+metadata:
+  name: sample
+  namespace: clickhouse
+spec:
+  replicas: 3
+  dataVolumeClaimSpec:
+    resources:
+      requests:
+        storage: 1Gi
+---
+apiVersion: clickhouse.com/v1alpha1
+kind: ClickHouseCluster
+metadata:
+  name: sample
+  namespace: clickhouse
+spec:
+  replicas: 2
+  dataVolumeClaimSpec:
+    resources:
+      requests:
+        storage: 1Gi
+  keeperClusterRef:
+    name: sample

@@ -1,0 +1,109 @@
+# =============================================================================
+# Production-grade ClickHouse + Keeper for a 4-node cluster
+# Topology: 3 Keepers (quorum) + ClickHouse 2 shards x 2 replicas (4 server pods)
+#   - shards=2 doubles usable storage and write throughput
+#   - replicas=2 keeps each shard HA on a separate node
+# Operator: ClickHouse/clickhouse-operator, apiVersion clickhouse.com/v1alpha1
+#
+# Note: Keeper stays at 3 even with 4 nodes. A 4th Keeper does not improve fault
+# tolerance (quorum still survives only 1 loss) and adds Raft latency. The 4th
+# node carries ClickHouse pods; let the scheduler place 4 server pods across the
+# 4 nodes via nodeHostnameKey anti-affinity.
+# =============================================================================
+---
+apiVersion: clickhouse.com/v1alpha1
+kind: KeeperCluster
+metadata:
+  name: prod
+  namespace: clickhouse
+  labels:
+    app.kubernetes.io/part-of: clickhouse-prod
+spec:
+  replicas: 3
+
+  podTemplate:
+    nodeHostnameKey: kubernetes.io/hostname
+    topologyZoneKey: topology.kubernetes.io/zone
+    terminationGracePeriodSeconds: 60
+
+  containerTemplate:
+    image:
+      repository: docker.io/clickhouse/clickhouse-keeper
+      tag: "25.3"                     # pin to a current LTS; verify the tag on Docker Hub
+    resources:
+      requests:
+        cpu: "1"
+        memory: 1Gi
+      limits:
+        memory: 2Gi
+
+  dataVolumeClaimSpec:
+    accessModes: ["ReadWriteOnce"]
+    storageClassName: fast-ssd        # CHANGE ME: SSD-backed, Retain reclaim policy
+    resources:
+      requests:
+        storage: 20Gi
+
+  podDisruptionBudget:
+    maxUnavailable: 1
+
+  settings:
+    logger:
+      level: information
+      jsonLogs: true
+---
+apiVersion: clickhouse.com/v1alpha1
+kind: ClickHouseCluster
+metadata:
+  name: prod
+  namespace: clickhouse
+  labels:
+    app.kubernetes.io/part-of: clickhouse-prod
+spec:
+  shards: 2
+  replicas: 2                         # 2 shards x 2 replicas = 4 server pods, one per node
+
+  keeperClusterRef:
+    name: prod
+
+  upgradeChannel: lts
+
+  podTemplate:
+    nodeHostnameKey: kubernetes.io/hostname        # spread the 4 pods across the 4 nodes
+    topologyZoneKey: topology.kubernetes.io/zone
+    terminationGracePeriodSeconds: 120
+
+  containerTemplate:
+    image:
+      repository: docker.io/clickhouse/clickhouse-server
+      tag: "25.3"
+    resources:
+      requests:
+        cpu: "4"
+        memory: 16Gi
+      limits:
+        memory: 32Gi                  # no CPU limit on ClickHouse
+
+  dataVolumeClaimSpec:
+    accessModes: ["ReadWriteOnce"]
+    storageClassName: fast-ssd        # CHANGE ME
+    resources:
+      requests:
+        storage: 500Gi                # per pod; usable capacity ~= storage x shards
+
+  podDisruptionBudget:
+    maxUnavailable: 1                 # with 2 replicas per shard, keeps 1 replica up per shard
+
+  settings:
+    defaultUserPassword:
+      passwordType: sha256_hash
+      secret:
+        name: clickhouse-default-user
+        key: password-sha256
+    logger:
+      level: information
+      jsonLogs: true
+    # tls:
+    #   enabled: true
+    #   serverCertSecret:
+    #     name: clickhouse-server-tls
