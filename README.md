@@ -413,6 +413,126 @@ SETTINGS storage_policy = 'hot_cold';
 
 Recent data stays on SSD; parts older than 90 days move to MinIO in the background and remain queryable with no change to your SQL. For an existing table you can `ALTER TABLE default.sales MODIFY TTL ...` and `MODIFY SETTING storage_policy = 'hot_cold'`, subject to ClickHouse's rule that the new policy must still contain the old volumes.
 
+## Access control and audit logging
+
+Depends on a running cluster (Part 1). This covers who can log in, with what password, what they are allowed to do, and how logins and queries are recorded for audit. It maps to SOC 2 access-control and audit-trail objectives. The full, ready-to-uncomment templates live in the prod manifests under `spec.settings.extraUsersConfig` and `spec.settings.extraConfig`; this section explains them.
+
+### The accounts in this stack
+
+| Account | Username | Password | Where it is set |
+| --- | --- | --- | --- |
+| ClickHouse admin | `default` | None on the dev cluster; in prod it is whatever you put in the Secret in step 1.3 | `clickhouse-default-user` Secret (SHA-256) |
+| BI / app users (examples) | `bi_readonly`, `etl_writer`, `ch_admin` (rename freely) | Not preset; you choose and hash it | `extraUsersConfig` in the CR, or SQL RBAC |
+| Superset UI login | `admin` | `admin` (placeholder, change it) | `superset-values.yaml` |
+
+The example users are templates. They have no password until you set one, and the usernames are just examples. Never inline a plaintext password; store it in 1Password and put only the SHA-256 hash in the manifest, or use SQL-driven RBAC below.
+
+### Setting a password for a CR user
+
+Choose the password, hash it, and put the hash in `password_sha256_hex`. The plaintext never goes in the file.
+
+```bash
+echo -n 'the-password-you-chose' | sha256sum
+# -> 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+```
+
+Uncomment the user in the manifest, paste the hash, and re-apply:
+
+```yaml
+    extraUsersConfig:
+      users:
+        bi_readonly:
+          password_sha256_hex: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+          profile: readonly
+          quota: bi_quota
+          networks:
+            ip: "10.0.0.0/8"        # restrict to the Superset pod CIDR
+```
+
+Superset (or any client) then connects with the **plaintext** password; the hash is only stored server-side:
+
+```
+clickhousedb://bi_readonly:the-password-you-chose@sample-clickhouse-headless.clickhouse.svc.cluster.local:8123/default
+```
+
+### Recommended: SQL-driven RBAC
+
+Defining users in the manifest puts a credential artifact in your repo and requires a re-apply per change. The cleaner pattern is to bootstrap one admin user with `access_management: 1` (in `extraUsersConfig`), then manage everything else with SQL, so grants live in the database and replicate automatically:
+
+```sql
+CREATE ROLE analyst;
+GRANT SELECT ON analytics.* TO analyst;
+
+CREATE USER bi_readonly IDENTIFIED WITH sha256_password BY '<password>' HOST IP '10.0.0.0/8';
+GRANT analyst TO bi_readonly;
+SET DEFAULT ROLE analyst TO bi_readonly;
+
+-- row-level security: this user only sees US rows
+CREATE ROW POLICY region_filter ON analytics.sales USING country = 'US' TO analyst;
+```
+
+LDAP / Active Directory auth is also supported: add an `<ldap_servers>` entry in `extraConfig` and set `ldap: { server: my_ad }` on the user instead of a password hash.
+
+### User option reference
+
+These go under each user or in a shared `profiles` / `quotas` block in `extraUsersConfig`:
+
+| Option | Purpose |
+| --- | --- |
+| `password_sha256_hex` | SHA-256 of the password. Prefer over plaintext `password`. |
+| `networks.ip` | Restrict the source CIDR a user may connect from. Avoid `::/0` in prod. |
+| `profile` | Named profile capping behavior and resources (see below). |
+| `quota` | Named quota rate-limiting the user over a rolling interval. |
+| `allow_databases.database` | Limit which databases the user can see. |
+| `access_management` | `1` lets the user run `CREATE USER/ROLE`, `GRANT`, `REVOKE` (SQL RBAC). |
+| profile: `readonly` | `0` read/write, `1` SELECT only, `2` SELECT + SET. |
+| profile: `allow_ddl` | `0` blocks `CREATE`/`ALTER`/`DROP`. |
+| profile: `max_memory_usage` / `max_execution_time` / `max_rows_to_read` | Per-query resource caps. |
+| quota: `interval.duration` + `queries` / `errors` / `read_rows` / `execution_time` | Per-window rate limits. |
+
+### Audit logging (the audit trail)
+
+ClickHouse records audit data in `system` tables. Enable and bound them in `extraConfig`, then query with normal SQL. The key ones:
+
+| Table | What it records | Default |
+| --- | --- | --- |
+| `system.session_log` | Every authentication attempt, success and failure, with user, address, interface | Off; enable it |
+| `system.query_log` | Every statement: text, user, rows, duration, memory | On |
+| `system.part_log` | Data-part lifecycle: merges, mutations, moves to the cold tier | On |
+| `system.text_log` | Server log lines as a queryable table | Off |
+
+`session_log` is the login audit trail and the most important for SOC 2, so enable it explicitly. Each block in `extraConfig` sets a retention TTL so the tables do not grow without bound:
+
+```yaml
+    extraConfig:
+      session_log:
+        database: system
+        table: session_log
+        engine: "ENGINE = MergeTree ORDER BY event_time TTL event_date + INTERVAL 90 DAY"
+      query_log:
+        engine: "ENGINE = MergeTree ORDER BY event_time TTL event_date + INTERVAL 90 DAY"
+      part_log:
+        engine: "ENGINE = MergeTree ORDER BY event_time TTL event_date + INTERVAL 30 DAY"
+```
+
+Example audit queries:
+
+```sql
+-- failed logins in the last 24h
+SELECT event_time, user, client_address, auth_failure_reason
+FROM system.session_log
+WHERE type = 'LoginFailure' AND event_time > now() - INTERVAL 1 DAY
+ORDER BY event_time DESC;
+
+-- who ran what against a table
+SELECT event_time, user, query
+FROM system.query_log
+WHERE type = 'QueryFinish' AND query ILIKE '%analytics.sales%'
+ORDER BY event_time DESC LIMIT 100;
+```
+
+These templates are CRD-valid but have not been applied against this operator version; confirm the exact `extraConfig` / `extraUsersConfig` nesting on a non-prod cluster before relying on them.
+
 ## Production best practices
 
 These are already reflected in the prod manifests. The reasoning matters for when you tune them.
