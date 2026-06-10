@@ -331,18 +331,52 @@ kubectl -n superset port-forward svc/superset 8088:8088
 
 This repo ships a working example: a dashboard named **Sales Overview** with five charts (Total Revenue, Total Orders, Revenue by Day, Revenue by Category, Revenue by Country), all querying ClickHouse live through the `clickhousedb` driver. Reproduce it end to end with the steps below. Do every step in order; nothing else is required.
 
-#### Step 1: Get a table to chart
+The order is always the same: first get data into a ClickHouse table (Step 1), then port-forward Superset (Step 2), then run the Python script to build the dashboard (Step 3), then open it (Step 4). Loading data and building the dashboard are separate stages. The data load happens entirely in ClickHouse; the Python script runs afterward and never touches MinIO.
 
-Either load the real data from MinIO Parquet (see "Loading Parquet from MinIO into ClickHouse" above), or load the bundled synthetic data for testing. The example expects a `default.sales` table.
+```
+Step 1  data -> ClickHouse        (Path A: from MinIO, or Path B: synthetic test data)
+Step 2  kubectl port-forward Superset
+Step 3  python3 build_dashboard.py   (builds connection + dataset + charts + dashboard)
+Step 4  open the dashboard in the browser
+```
 
-To load the synthetic data, apply [sample-data.sql](sample-data.sql) by piping it into `clickhouse-client` on any ClickHouse pod. Because the `default` database is a Replicated engine, this single statement propagates to all replicas and the rows replicate through Keeper:
+#### Step 1: Get a `default.sales` table into ClickHouse
+
+The dashboard needs a table to chart. Pick ONE of the two paths below based on whether your data is already in MinIO. Both run `clickhouse-client` inside a ClickHouse pod over `kubectl exec`; you do not install anything locally and you do not connect to MinIO from your laptop. In Path A, ClickHouse itself reaches out to MinIO from inside the cluster.
+
+Add `--password "<pw>"` to every `clickhouse-client` command below once the `default` user has a password.
+
+**Path A: my data is already in MinIO as Parquet.**
+
+Run the create-table and the `s3()` load directly on a pod. ClickHouse pulls the Parquet from MinIO over the network. First edit the placeholders (endpoint, bucket/path, keys, format) as described in "Loading Parquet from MinIO into ClickHouse" above.
+
+```bash
+# 1a. create the native replicated table (propagates to all replicas)
+kubectl exec -n clickhouse sample-clickhouse-0-0-0 -- clickhouse-client -q "
+CREATE TABLE IF NOT EXISTS default.sales (
+  order_id UInt64, order_date Date,
+  country LowCardinality(String), category LowCardinality(String),
+  quantity UInt32, amount Decimal(12,2)
+) ENGINE = ReplicatedMergeTree ORDER BY (order_date, country)"
+
+# 1b. ClickHouse reads the Parquet straight from MinIO and loads it
+kubectl exec -n clickhouse sample-clickhouse-0-0-0 -- clickhouse-client -q "
+INSERT INTO default.sales
+SELECT order_id, order_date, country, category, quantity, amount
+FROM s3('http://minio.minio.svc.cluster.local:9000/<BUCKET>/sales/*.parquet',
+        '<ACCESS_KEY>', '<SECRET_KEY>', 'Parquet')"
+```
+
+**Path B: I have no MinIO yet and just want to test.**
+
+Load the bundled synthetic data instead. Pipe [sample-data.sql](sample-data.sql) into `clickhouse-client` on a pod; it creates the same table and inserts 200,000 rows:
 
 ```bash
 kubectl exec -i -n clickhouse sample-clickhouse-0-0-0 -- \
   clickhouse-client --multiquery < sample-data.sql
 ```
 
-Add `--password "<pw>"` once the `default` user has a password. Verify the rows landed on both replicas, which matters because Superset connects through the load-balancing headless service:
+**Then, for either path, verify the rows replicated to both pods.** This matters because Superset connects through the load-balancing headless service and may hit either replica:
 
 ```bash
 for p in sample-clickhouse-0-0-0 sample-clickhouse-0-1-0; do
@@ -351,7 +385,7 @@ for p in sample-clickhouse-0-0-0 sample-clickhouse-0-1-0; do
 done
 ```
 
-Both pods should report the same count (200000) and sum.
+Both pods must report the same count and sum. Once they do, the data step is done. Nothing about loading data involves the Python script; that comes later in Step 3.
 
 #### Step 2: Port-forward Superset
 
