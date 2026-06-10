@@ -72,11 +72,27 @@ spec:
     nodeHostnameKey: kubernetes.io/hostname        # one replica per node
     topologyZoneKey: topology.kubernetes.io/zone
     terminationGracePeriodSeconds: 120
+    # Run ClickHouse on dedicated, labeled+tainted nodes so it does not compete
+    # with other workloads. Label/taint the nodes, then uncomment:
+    # nodeSelector:
+    #   workload: clickhouse
+    # tolerations:
+    #   - key: dedicated
+    #     operator: Equal
+    #     value: clickhouse
+    #     effect: NoSchedule
+    # priorityClassName: high-priority   # keep DB pods from being evicted under pressure
+    # imagePullSecrets:                  # pull images from a private registry
+    #   - name: registry-creds
 
   containerTemplate:
     image:
       repository: docker.io/clickhouse/clickhouse-server
       tag: "25.3"                     # pin; keep server and keeper on compatible versions
+    # imagePullPolicy: IfNotPresent
+    # env:                             # extra container env, e.g. force the server timezone
+    #   - name: TZ
+    #     value: UTC
     resources:
       requests:
         cpu: "4"
@@ -133,3 +149,49 @@ spec:
     #             disk: default      # the SSD data volume the operator provisions
     #           cold:
     #             disk: s3_cold      # MinIO
+    #
+    # enableDatabaseSync: true        # default; sync databases to newly added replicas
+    #
+    # Least-privilege BI user for Superset instead of connecting as `default`.
+    # extraUsersConfig merges into the ClickHouse users config. Generate the hash
+    # with: echo -n '<pw>' | sha256sum. Source it from a Secret where possible.
+    # extraUsersConfig:
+    #   profiles:
+    #     readonly:
+    #       readonly: 1               # SELECT only; 2 also allows SET for the session
+    #   users:
+    #     bi_readonly:
+    #       password_sha256_hex: <SHA256_OF_PASSWORD>
+    #       profile: readonly
+    #       quota: default
+    #       networks:
+    #         ip: "::/0"              # restrict to the Superset pod CIDR in production
+    #
+    # NOTE: there is only ONE extraConfig: block. The cold-tier storage_configuration
+    # above, the named_collections here, and the prometheus block below all live
+    # under the SAME extraConfig:. If you enable more than one, merge their keys
+    # under a single extraConfig: rather than repeating the key (duplicate YAML key).
+    #
+    # Named credentials so s3() ingestion and S3 table engines reference a name
+    # instead of inlining MinIO keys in SQL. Mount the keys from a Secret in prod.
+    # Use as: s3(minio, filename='sales/*.parquet', format='Parquet')
+    # extraConfig:
+    #   named_collections:
+    #     minio:
+    #       url: http://minio.minio.svc.cluster.local:9000/<BUCKET>/
+    #       access_key_id: <ACCESS_KEY>
+    #       secret_access_key: <SECRET_KEY>
+    #   # Useful server-wide settings and log retention:
+    #   max_concurrent_queries: 200
+    #   query_log:
+    #     engine: "ENGINE = MergeTree ORDER BY event_time TTL event_date + INTERVAL 30 DAY"
+    #
+    # Expose Prometheus metrics on :9363 (already exposed by the operator service;
+    # add scrape annotations via spec.annotations if your Prometheus uses them).
+    # extraConfig:
+    #   prometheus:
+    #     endpoint: /metrics
+    #     port: 9363
+    #     metrics: true
+    #     events: true
+    #     asynchronous_metrics: true
