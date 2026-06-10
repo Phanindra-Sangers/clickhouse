@@ -107,3 +107,25 @@ spec:
     #   enabled: true
     #   serverCertSecret:
     #     name: clickhouse-server-tls
+    #
+    # Cold-tier lifecycle: keep hot data on SSD and move old data to MinIO
+    # automatically while it stays queryable. Uncomment, set the MinIO endpoint,
+    # bucket, and keys (prefer a <named_collections> entry over inline keys), then
+    # create tables with `SETTINGS storage_policy = 'hot_cold'` and a TTL such as
+    # `TTL order_date + INTERVAL 90 DAY TO VOLUME 'cold'`. Verify the extraConfig
+    # nesting against your operator version before relying on it.
+    # extraConfig:
+    #   storage_configuration:
+    #     disks:
+    #       s3_cold:
+    #         type: s3
+    #         endpoint: http://minio.minio.svc.cluster.local:9000/clickhouse-cold/
+    #         access_key_id: <ACCESS_KEY>
+    #         secret_access_key: <SECRET_KEY>
+    #     policies:
+    #       hot_cold:
+    #         volumes:
+    #           hot:
+    #             disk: default      # the SSD data volume the operator provisions
+    #           cold:
+    #             disk: s3_cold      # MinIO
