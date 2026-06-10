@@ -22,6 +22,27 @@ Hive Metastore can be retired entirely once data lives in native ClickHouse tabl
 
 MinIO is worth keeping. Use it as the backup target for `clickhouse-backup`, as a cold tier where infrequently accessed parts live on object storage via a storage policy while hot data stays on local SSD, and as a source for ingestion or occasional query-in-place over lake data. The recommended end state is to ingest your datasets into native ClickHouse `ReplicatedMergeTree` tables, retire Hive Metastore, and keep MinIO only for backups and cold storage.
 
+### Where your data lives: ClickHouse vs MinIO
+
+In the old stack MinIO was the source of truth. Applications wrote Parquet files into MinIO, and Trino, which has no storage of its own, read those files over the network to answer queries. Storage and compute were separate.
+
+ClickHouse is a database, not just a query engine. It has its own storage in an optimized on-disk format (MergeTree) on the SSD volumes you provisioned, and queries run against that local storage, which is far faster than scanning Parquet in object storage. So applications now write **directly into ClickHouse**, with an `INSERT` over its HTTP or native protocol or a stream such as Kafka, instead of dropping files into MinIO. For that data, MinIO is no longer in the write path or the query path.
+
+That demotes MinIO from primary store to a supporting role with three uses: cold tiered storage (see "Tiering cold data to MinIO" below), backup target for `clickhouse-backup`, and occasional query-in-place over lake files you deliberately leave outside ClickHouse.
+
+Decide per dataset:
+
+- Put it **inside ClickHouse** (native tables) when it is queried often and you want speed. This is the default and where most former Trino workloads belong. MinIO then serves only as the cold tier and backup target for that data.
+- Leave it **in MinIO as files**, queried in place with `s3()` or the `Iceberg`/`DeltaLake` engines, only when it is large, rarely touched, and not worth the cost of loading.
+
+```
+write path:   app --INSERT--> ClickHouse (SSD, MergeTree)        [new default]
+              app --file----> MinIO (Parquet)  <--query in place-- ClickHouse [exception]
+
+lifecycle:    hot data on SSD --auto-tiered by TTL--> cold data on MinIO (still queryable)
+              ClickHouse --backup--> MinIO
+```
+
 ## What is in this repo
 
 ```
@@ -350,6 +371,47 @@ Open the dashboard: with the port-forward running, open the printed URL or go to
 Export a dashboard from the Dashboards list as a ZIP bundle and import the same bundle in the target Superset. The bundle carries the charts, the dataset, and the database reference, so promoting dev to production is one import plus updating the database password. The scripted approach also works across environments by changing the environment variables above.
 
 ---
+
+## Tiering cold data to MinIO (optional)
+
+Depends on a running cluster (Part 1). This is how MinIO becomes the cold tier. Keep hot, recent data on SSD and let ClickHouse move old data to MinIO automatically, while it stays fully queryable. You define a MinIO-backed disk and a storage policy in the cluster spec, then attach a TTL to the table.
+
+Treat the block below as a template to adapt and verify against your operator version and MinIO, and source the keys from a `<named_collections>` entry backed by a Secret rather than inlining them. Add the disk and policy to the `ClickHouseCluster` under `spec.settings.extraConfig`, which the operator merges into the ClickHouse server config:
+
+```yaml
+spec:
+  settings:
+    extraConfig:
+      storage_configuration:
+        disks:
+          s3_cold:
+            type: s3
+            endpoint: http://minio.minio.svc.cluster.local:9000/clickhouse-cold/
+            access_key_id: <ACCESS_KEY>
+            secret_access_key: <SECRET_KEY>
+        policies:
+          hot_cold:
+            volumes:
+              hot:
+                disk: default      # the SSD data volume the operator provisions
+              cold:
+                disk: s3_cold      # MinIO
+```
+
+Then create the table with that policy and a TTL that moves data older than 90 days to the cold volume:
+
+```sql
+CREATE TABLE default.sales (
+  order_id UInt64, order_date Date,
+  country LowCardinality(String), category LowCardinality(String),
+  quantity UInt32, amount Decimal(12,2)
+) ENGINE = ReplicatedMergeTree
+ORDER BY (order_date, country)
+TTL order_date + INTERVAL 90 DAY TO VOLUME 'cold'
+SETTINGS storage_policy = 'hot_cold';
+```
+
+Recent data stays on SSD; parts older than 90 days move to MinIO in the background and remain queryable with no change to your SQL. For an existing table you can `ALTER TABLE default.sales MODIFY TTL ...` and `MODIFY SETTING storage_policy = 'hot_cold'`, subject to ClickHouse's rule that the new policy must still contain the old volumes.
 
 ## Production best practices
 
