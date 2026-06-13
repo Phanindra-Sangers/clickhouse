@@ -112,7 +112,10 @@ spec:
 
   settings:
     defaultUserPassword:
-      passwordType: sha256_hash
+      passwordType: password_sha256_hex   # MUST be password_sha256_hex; the operator
+                                          # writes this verbatim as the users.yaml auth
+                                          # key, and ClickHouse rejects any other value
+                                          # (e.g. sha256_hash) with CANNOT_LOAD_CONFIG.
       secret:
         name: clickhouse-default-user
         key: password-sha256

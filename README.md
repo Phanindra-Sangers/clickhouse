@@ -621,7 +621,7 @@ Required: `keeperClusterRef`.
 
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `defaultUserPassword.passwordType` | string | `password` | Use `sha256_hash` for hashed secrets. See ClickHouse user settings docs. |
+| `defaultUserPassword.passwordType` | string | `password` | Use `password_sha256_hex` for a hashed secret. The operator writes this value verbatim as the auth key in `users.yaml`, so it must be a valid ClickHouse key (`password_sha256_hex`, `password_double_sha1_hex`, or `password`). An invalid value such as `sha256_hash` crashes the pod with `CANNOT_LOAD_CONFIG`. |
 | `defaultUserPassword.secret.name` / `.key` | string | — | Source the password from a Secret key (recommended). |
 | `defaultUserPassword.configMap.name` / `.key` | string | — | Alternative source from a ConfigMap key. |
 | `enableDatabaseSync` | boolean | `true` | Sync existing databases to newly created replicas. |
