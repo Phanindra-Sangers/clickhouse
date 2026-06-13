@@ -152,19 +152,22 @@ kubectl get crd | grep clickhouse.com
 
 ### 1.3 Create the namespace and default-user password Secret
 
-The ClickHouse `default` user must have a password in production. Source it from a Secret as a SHA-256 hash; never inline a plaintext password in the manifest.
+Why this password exists. `default` is ClickHouse's built-in superuser with full privileges. If it has no password, the operator configures it as `no_password`, which means authentication is **disabled** for that account: ClickHouse ignores whatever password a client sends, so any password (or none) connects. Anyone who can reach port 8123/9000 then has full admin. Setting a password switches the account to `sha256_password`, so only the correct password authenticates and wrong or empty passwords are rejected. This is the baseline access control before you create per-team users, and it maps directly to the SOC 2 access-control objective. See the dedicated "Access control and audit logging" section for restricted BI and ETL users; the `default` password is the cluster's root credential, used sparingly.
+
+The password is stored as a SHA-256 **hash** in a Secret, never as plaintext in the manifest. ClickHouse stores only the hash; clients still send the plaintext, which ClickHouse hashes and compares.
 
 ```bash
 kubectl create namespace clickhouse
 
 PW='REPLACE-with-a-strong-password'
+# Use printf, NOT echo: echo appends a newline and the hash will not match the plaintext.
 HASH=$(printf '%s' "$PW" | sha256sum | awk '{print $1}')
 kubectl create secret generic clickhouse-default-user \
   -n clickhouse \
   --from-literal=password-sha256="$HASH"
 ```
 
-Store the plaintext password in 1Password, not in this repo or your shell history. The manifests reference this Secret via `spec.settings.defaultUserPassword.secret`.
+Store the plaintext password in 1Password, not in this repo or your shell history. The manifests reference this Secret via `spec.settings.defaultUserPassword.secret` with `passwordType: password_sha256_hex`. That `passwordType` must be exactly `password_sha256_hex`: the operator writes it verbatim as the auth key in the generated `users.yaml`, and an invalid value such as `sha256_hash` crashes the pod with `CANNOT_LOAD_CONFIG`. You connect later with the **plaintext** password, not the hash.
 
 ### 1.4 Edit the manifest, then deploy
 
@@ -282,6 +285,54 @@ done
 ```
 
 Both pods must report the same count and sum. Once they match, Part 2 is done.
+
+---
+
+## Demo: ClickHouse needs no separate Hive Metastore
+
+Use this to show the team that the Trino + Hive Metastore + MinIO stack collapses into just ClickHouse. The point to make: Trino could not answer a query without Hive Metastore telling it which files a table maps to. ClickHouse needs no such service, and you can prove it two ways in a few commands. Run these in a pod: `kubectl exec -n clickhouse sample-clickhouse-0-0-0 -- clickhouse-client -q "<query>"`.
+
+### Proof 1: the catalog is built in
+
+The table metadata that Trino fetched from Hive Metastore (which tables exist, their columns and types) lives inside ClickHouse. There is no external catalog to deploy or query.
+
+```sql
+SHOW TABLES FROM default;                                   -- the catalog
+DESCRIBE default.sales;                                     -- columns and types, no HMS
+SELECT name, engine, total_rows FROM system.tables WHERE database = 'default';
+SELECT country, round(sum(amount)) AS revenue               -- query straight away
+FROM default.sales GROUP BY country ORDER BY revenue DESC;
+```
+
+Trino needs a running Hive Metastore plus a catalog config to do the same. Here it is three statements against one system.
+
+### Proof 2: query lake files by path, still no metastore
+
+If some data stays as Parquet in MinIO, ClickHouse reads it directly by giving a path, credentials, and format. Hive Metastore's whole job, mapping a table name to file locations, is replaced by naming the path. Schema is inferred from the files.
+
+```sql
+-- Point at the files; no CREATE TABLE, no catalog, no metastore.
+SELECT country, round(sum(amount)) AS revenue
+FROM s3('http://minio.minio.svc.cluster.local:9000/<BUCKET>/sales/*.parquet',
+        '<ACCESS_KEY>', '<SECRET_KEY>', 'Parquet')
+GROUP BY country ORDER BY revenue DESC;
+
+DESCRIBE s3('http://minio.minio.svc.cluster.local:9000/<BUCKET>/sales/*.parquet',
+            '<ACCESS_KEY>', '<SECRET_KEY>', 'Parquet');   -- schema inferred from the files
+```
+
+For Iceberg or Delta tables, swap `s3(...)` for the `iceberg(...)` or `deltaLake(...)` function; ClickHouse reads the table format's own manifests, again with no Hive Metastore.
+
+Offline variant when you have no MinIO handy: the local `file()` function is the same point-at-files model but reads from the pod's `user_files` directory (`/var/lib/clickhouse/user_files/`). It writes a throwaway file inside the pod, nothing leaves it:
+
+```sql
+INSERT INTO FUNCTION file('demo/sales.parquet', 'Parquet')
+  SELECT * FROM default.sales SETTINGS engine_file_truncate_on_insert = 1;
+SELECT country, round(sum(amount)) FROM file('demo/sales.parquet', 'Parquet')
+  GROUP BY country ORDER BY 2 DESC LIMIT 3;     -- queried by path+format, no metastore
+```
+
+The takeaway for the migration: native tables (Proof 1) cover the workloads you load into ClickHouse, and direct file access (Proof 2) covers anything you leave in MinIO. Neither path uses Hive Metastore, so it is retired, and MinIO drops to the cold-tier and backup role described earlier.
 
 ---
 
