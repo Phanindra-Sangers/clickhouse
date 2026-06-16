@@ -1,0 +1,118 @@
+# =============================================================================
+# Production-grade StarRocks (kube-starrocks chart 1.11.5, StarRocks 4.1).
+# HA layout: 3 FE (metadata quorum) + 3 BE (default replication_num=3 works),
+# one of each per node via anti-affinity, on SSD storage with Retain.
+#
+# Prereqs before install:
+#   1. A real SSD-backed StorageClass with reclaim policy Retain (set below).
+#   2. A root password Secret (key must be "password"); the manifest references it:
+#        kubectl create secret generic starrocks-root-password \
+#          -n starrocks --from-literal=password='<choose-a-strong-password>'
+#      Store the plaintext in 1Password. Do not inline it here.
+#   3. At least 3 worker nodes so the per-node anti-affinity can place all pods.
+# =============================================================================
+
+operator:
+  starrocksOperator:
+    resources:
+      requests:
+        cpu: 200m
+        memory: 300Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
+starrocks:
+  # Set the root password on first install via a pre-created Secret (see prereq 2).
+  initPassword:
+    enabled: true
+    isInstall: true
+    passwordSecret: starrocks-root-password   # Secret with key "password"
+
+  # ---------------------------------------------------------------------------
+  # Frontend (FE): metadata, SQL parsing, cost-based optimizer, MySQL :9030,
+  # web UI :8030. 3 replicas form the metadata quorum (odd number, like Keeper).
+  # ---------------------------------------------------------------------------
+  starrocksFESpec:
+    replicas: 3
+    resources:
+      requests:
+        cpu: "4"
+        memory: 10Gi          # must exceed the JVM -Xmx below plus overhead
+      limits:
+        cpu: "8"
+        memory: 12Gi
+    # FE config: JVM heap is the main knob. Keep -Xmx a few GB under the mem limit.
+    config: |
+      LOG_DIR = ${STARROCKS_HOME}/log
+      DATE = "$(date +%Y%m%d-%H%M%S)"
+      JAVA_OPTS="-Dlog4j2.formatMsgNoLookups=true -Xmx8192m -XX:+UseG1GC -Xlog:gc*:${LOG_DIR}/fe.gc.log.$DATE:time"
+      http_port = 8030
+      rpc_port = 9020
+      query_port = 9030
+      edit_log_port = 9010
+      mysql_service_nio_enabled = true
+      sys_log_level = INFO
+      min_graceful_exit_time_second = 25
+    # Persistent metadata + logs on SSD; metadata loss = cluster loss, so Retain.
+    storageSpec:
+      name: fe
+      storageClassName: fast-ssd        # CHANGE ME: SSD-backed, Retain reclaim policy
+      storageSize: 50Gi                 # FE metadata; grows with table/partition count
+      logStorageSize: 10Gi
+    terminationGracePeriodSeconds: 120
+    # Spread the 3 FE pods across distinct nodes (one FE per node).
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app.kubernetes.io/component: fe
+            topologyKey: kubernetes.io/hostname
+    service:
+      type: ClusterIP                   # use LoadBalancer or an Ingress to expose :9030/:8030 externally
+    # Dedicated nodes (label + taint your DB nodes, then uncomment):
+    # nodeSelector:
+    #   workload: starrocks
+    # tolerations:
+    #   - key: dedicated
+    #     operator: Equal
+    #     value: starrocks
+    #     effect: NoSchedule
+
+  # ---------------------------------------------------------------------------
+  # Backend (BE): columnar storage + query execution. 3 replicas so the default
+  # replication_num=3 is satisfied and any one BE can be lost without data loss.
+  # ---------------------------------------------------------------------------
+  starrocksBeSpec:
+    replicas: 3
+    resources:
+      requests:
+        cpu: "8"
+        memory: 16Gi
+      limits:
+        cpu: "16"
+        memory: 32Gi          # BE mem_limit defaults to ~90% of this
+    # Persistent data + logs on fast SSD/NVMe; size data to your dataset.
+    storageSpec:
+      name: be
+      storageClassName: fast-ssd        # CHANGE ME: SSD/NVMe, Retain reclaim policy
+      storageSize: 1Ti                  # per BE; total usable ~= size * BEs / replication_num
+      logStorageSize: 10Gi
+    terminationGracePeriodSeconds: 120
+    # Spread the 3 BE pods across distinct nodes (one BE per node).
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app.kubernetes.io/component: be
+            topologyKey: kubernetes.io/hostname
+    # nodeSelector / tolerations: same dedicated-node pattern as FE above.
+
+  # ---------------------------------------------------------------------------
+  # Optional components (left disabled):
+  #  - starrocksCnSpec: stateless Compute Nodes for shared-data mode (storage in
+  #    S3/MinIO, elastic compute). Enable via starrocksCluster.enabledCn: true.
+  #  - starrocksFeProxySpec: an nginx proxy for HTTP Stream Load ingestion.
+  # ---------------------------------------------------------------------------

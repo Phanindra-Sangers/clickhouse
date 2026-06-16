@@ -1,0 +1,42 @@
+# kube-starrocks values, sized down for a single-node kind cluster (demo only).
+# Production StarRocks wants far more: FE 8Gi+, BE 16Gi+ and fast local NVMe.
+operator:
+  starrocksOperator:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 200Mi
+      limits:
+        cpu: 500m
+        memory: 800Mi
+
+starrocks:
+  # Frontend: metadata, SQL parsing/planning, MySQL protocol :9030, HTTP UI :8030
+  starrocksFESpec:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+    storageSpec:
+      name: fe
+      storageClassName: standard
+      storageSize: 5Gi
+
+  # Backend: storage + query execution, web :8040
+  starrocksBeSpec:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "1"
+        memory: 3Gi
+      limits:
+        cpu: "3"
+        memory: 6Gi
+    storageSpec:
+      name: be
+      storageClassName: standard
+      storageSize: 20Gi
